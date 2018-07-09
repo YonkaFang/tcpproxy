@@ -31,6 +31,10 @@ type TargetListener struct {
 	nextConn net.Conn
 }
 
+func (tl *TargetListener) Equals(o interface{}) bool {
+	return false
+}
+
 var (
 	_ net.Listener = (*TargetListener)(nil)
 	_ Target       = (*TargetListener)(nil)

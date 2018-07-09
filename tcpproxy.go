@@ -93,6 +93,14 @@ type Proxy struct {
 	ListenFunc func(net, laddr string) (net.Listener, error)
 }
 
+func NewProxy() *Proxy {
+	res := &Proxy{}
+	res.runtimeLock = &sync.Mutex{}
+	res.runtimeConfigs = make(map[string]*config)
+
+	return res
+}
+
 // Matcher reports whether hostname matches the Matcher's criteria.
 type Matcher func(ctx context.Context, hostname string) bool
 
