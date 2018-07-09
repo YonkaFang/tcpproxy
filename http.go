@@ -46,6 +46,10 @@ type httpHostMatch struct {
 	target  Target
 }
 
+func (m httpHostMatch) Equals(o interface{}) bool {
+	return false
+}
+
 func (m httpHostMatch) match(br *bufio.Reader) (Target, string) {
 	hh := httpHostHeader(br)
 	if m.matcher(context.TODO(), hh) {

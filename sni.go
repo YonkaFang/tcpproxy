@@ -73,6 +73,10 @@ type sniMatch struct {
 	target  Target
 }
 
+func (m sniMatch) Equals(o interface{}) bool {
+	return false
+}
+
 func (m sniMatch) match(br *bufio.Reader) (Target, string) {
 	sni := clientHelloServerName(br)
 	if m.matcher(context.TODO(), sni) {
@@ -86,6 +90,10 @@ func (m sniMatch) match(br *bufio.Reader) (Target, string) {
 // response.
 type acmeMatch struct {
 	cfg *config
+}
+
+func (m *acmeMatch) Equals(o interface{}) bool {
+	return false
 }
 
 func (m *acmeMatch) match(br *bufio.Reader) (Target, string) {
@@ -184,7 +192,7 @@ func clientHelloServerName(br *bufio.Reader) (sni string) {
 // sniSniffConn is a net.Conn that reads from r, fails on Writes,
 // and crashes otherwise.
 type sniSniffConn struct {
-	r        io.Reader
+	r io.Reader
 	net.Conn // nil; crash on any unexpected use
 }
 

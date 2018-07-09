@@ -61,6 +61,13 @@ import (
 	"log"
 	"net"
 	"time"
+	"sync"
+	"strings"
+)
+
+var (
+	errNotReady     = errors.New("not ready now")
+	errInvalidState = errors.New("invalid state")
 )
 
 // Proxy is a proxy. Its zero value is a valid proxy that does
@@ -69,7 +76,12 @@ import (
 // The order that routes are added in matters; each is matched in the order
 // registered.
 type Proxy struct {
+	// init configs
 	configs map[string]*config // ip:port => config
+
+	// runtime configs
+	runtimeConfigs map[string]*config
+	runtimeLock    *sync.Mutex
 
 	lns   []net.Listener
 	donec chan struct{} // closed before err
@@ -93,9 +105,107 @@ func equals(want string) Matcher {
 
 // config contains the proxying state for one listener.
 type config struct {
-	routes      []route
+	ln         net.Listener
+	listenAddr *net.TCPAddr
+	p          *Proxy
+
+	routes      *routes
 	acmeTargets []Target // accumulates targets that should be probed for acme.
 	stopACME    bool     // if true, AddSNIRoute doesn't add targets to acmeTargets.
+}
+
+func newConfig(p *Proxy) *config {
+	return &config{
+		p:      p,
+		routes: &routes{},
+	}
+}
+
+// caller should has set ln, then lock is not needed and ln would not be nil
+func (c *config) cacheAddr() (res *net.TCPAddr) {
+	existed := c.ln
+
+	addr := existed.Addr()
+	var tcpAddr *net.TCPAddr
+	var ok bool
+	var err error
+
+	if tcpAddr, ok = addr.(*net.TCPAddr); !ok {
+		addrStr := addr.String()
+
+		if tcpAddr, err = net.ResolveTCPAddr(addrStr, "tcp"); err != nil {
+			log.Printf("ResolveTCPAddr(%s, tcp) met err(%v)", addrStr, err)
+			// 不可思议，只能panic了
+			panic("non-tcp-addr: " + addrStr)
+		}
+	}
+
+	c.listenAddr = tcpAddr
+
+	return tcpAddr
+}
+func (c *config) RemoveCredential(cr *Credential) (err error) {
+	var rm, left int
+	if rm, left, err = c.routes.remove(cr.r); err != nil {
+		log.Printf("c.routes.remove(%v) met err(%v)", cr.r, err)
+		return
+	}
+
+	if rm > 0 && left == 0 {
+		c.p.runtimeLock.Lock()
+		ln := c.ln
+
+		if ln != nil {
+			// XXX 锁的稍久
+			if err = ln.Close(); err != nil {
+				log.Printf("ln.Close met err(%v)", err)
+			}
+			c.ln = nil
+			c.listenAddr = nil
+		}
+
+		c.p.runtimeLock.Unlock()
+	}
+
+	cr.state = RouteStateRemoved
+
+	return
+}
+
+const (
+	RouteStateNew     = iota
+	RouteStateRunning
+	RouteStatePaused
+	RouteStateRemoved
+	RouteStateInvalid
+)
+
+type Credential struct {
+	// TODO
+	r     route
+	state int
+	c     *config
+}
+
+func (c *Credential) Remove() (err error) {
+	if c.state == RouteStateRemoved {
+		return
+	}
+
+	if err = c.c.RemoveCredential(c); err != nil {
+		log.Printf("c.c.RemoveCredential(%v) met err(%v)", c, err)
+		return
+	}
+
+	return
+}
+
+func (c *Credential) State() (res int) {
+	return c.state
+}
+
+func (c *Credential) Addr() net.Addr {
+	return c.c.listenAddr
 }
 
 // A route matches a connection to a target.
@@ -111,6 +221,7 @@ type route interface {
 	// If an sni or host header was parsed successfully, that will be
 	// returned as the second parameter.
 	match(*bufio.Reader) (Target, string)
+	Equals(o interface{}) bool
 }
 
 func (p *Proxy) netListen() func(net, laddr string) (net.Listener, error) {
@@ -125,14 +236,14 @@ func (p *Proxy) configFor(ipPort string) *config {
 		p.configs = make(map[string]*config)
 	}
 	if p.configs[ipPort] == nil {
-		p.configs[ipPort] = &config{}
+		p.configs[ipPort] = newConfig(p)
 	}
 	return p.configs[ipPort]
 }
 
 func (p *Proxy) addRoute(ipPort string, r route) {
 	cfg := p.configFor(ipPort)
-	cfg.routes = append(cfg.routes, r)
+	cfg.routes.add(r)
 }
 
 // AddRoute appends an always-matching route to the ipPort listener,
@@ -146,8 +257,92 @@ func (p *Proxy) AddRoute(ipPort string, dest Target) {
 	p.addRoute(ipPort, fixedTarget{dest})
 }
 
+func (p *Proxy) AddRuntimeRoute(ipPort string, dst Target) (res *Credential, err error) {
+	var index = strings.LastIndex(ipPort, ":")
+	var noPort bool
+	if index < 0 || index < strings.LastIndex(ipPort, "]") {
+		// no port
+		noPort = true
+	}
+
+	var config *config
+	if !noPort {
+		// for noPort case, ipPort for key will be determined after listen action
+		p.runtimeLock.Lock()
+		config = p.runtimeConfigs[ipPort]
+		if config == nil {
+			config = newConfig(p)
+			p.runtimeConfigs[ipPort] = config
+		}
+		p.runtimeLock.Unlock()
+	} else {
+		config = newConfig(p)
+	}
+
+	p.runtimeLock.Lock()
+	var ln = config.ln
+	p.runtimeLock.Unlock()
+
+	if ln == nil {
+		// 这里靠listen本身的互斥来...
+		// 如果是带端口的，那只有一个能成功
+		// 如果不是，那本来就不互斥
+		if ln, err = p.netListen()("tcp", ipPort); err != nil {
+			log.Printf("netListen(tcp, %s) met err(%v)", ipPort, err)
+		}
+
+		p.runtimeLock.Lock()
+		existed := config.ln
+		if existed == nil {
+			config.ln = ln
+		} else {
+			ln = existed
+		}
+		p.runtimeLock.Unlock()
+
+		if ln == nil {
+			return
+		}
+
+		if existed != nil {
+			log.Printf("config.ln != nil, other exec-flow preepmts, continue current exec-flow")
+		} else {
+			config.cacheAddr()
+
+			if noPort {
+				ipPort = fmt.Sprintf("%s:%d", ipPort, config.listenAddr.Port)
+				p.runtimeConfigs[ipPort] = config
+			}
+
+			errCh := make(chan error, 1)
+			go p.serveListener(errCh, ln, config.routes)
+		}
+	}
+
+	routes := config.routes
+	newRoute := fixedTarget{dst}
+	log.Printf("add new route (%v) to config(of ipPort %s)", newRoute, ipPort)
+	routes.add(newRoute)
+
+	res = &Credential{
+		c:     config,
+		r:     newRoute,
+		state: RouteStateRunning,
+	}
+
+	return
+}
+
 type fixedTarget struct {
 	t Target
+}
+
+func (m fixedTarget) Equals(o interface{}) bool {
+	om, ok := o.(fixedTarget)
+	if !ok {
+		return false
+	}
+	return om.t.Equals(m.t)
 }
 
 func (m fixedTarget) match(*bufio.Reader) (Target, string) { return m.t, "" }
@@ -211,7 +406,7 @@ func (p *Proxy) awaitFirstError(errc <-chan error) {
 	close(p.donec)
 }
 
-func (p *Proxy) serveListener(ret chan<- error, ln net.Listener, routes []route) {
+func (p *Proxy) serveListener(ret chan<- error, ln net.Listener, routes *routes) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -222,11 +417,112 @@ func (p *Proxy) serveListener(ret chan<- error, ln net.Listener, routes []route)
 	}
 }
 
+type routes struct {
+	runtimeMutable bool
+	done           bool
+
+	items []route
+	l     *sync.RWMutex
+}
+
+func newRoutes() *routes {
+	return &routes{
+		l: &sync.RWMutex{},
+	}
+}
+
+func (r *routes) routes() (res []route) {
+	if r.runtimeMutable {
+		r.l.RLock()
+		defer r.l.Unlock()
+
+		res = r.items
+	} else {
+		res = r.items
+	}
+
+	return
+}
+
+func (r *routes) Len() int {
+	if r.runtimeMutable {
+		r.l.RLock()
+		defer r.l.Unlock()
+		return len(r.items)
+	} else {
+		return len(r.items)
+	}
+}
+
+func (r *routes) markDone() {
+	r.done = true
+}
+
+func (r *routes) add(toAdd route) (err error) {
+	if r.runtimeMutable {
+		r.l.Lock()
+		defer r.l.Unlock()
+	} else {
+		if r.done {
+			log.Printf("add after mark done")
+			err = errInvalidState
+			return
+		}
+	}
+
+	r.items = append(r.items, toAdd)
+
+	return
+}
+
+func (r *routes) remove(toRm route) (rm, left int, err error) {
+	if r.runtimeMutable {
+		r.l.Lock()
+		defer r.l.Unlock()
+	} else {
+		if r.done {
+			log.Printf("add after mark done")
+			err = errInvalidState
+			return
+		}
+	}
+
+	rm = r.unsafeRemove(toRm)
+	left = len(r.items)
+
+	return
+}
+
+// XXX add test case
+func (r *routes) unsafeRemove(toRm route) int {
+	items := r.items
+	count := 0
+	total := len(items)
+
+	for i, item := range items {
+		if item.Equals(toRm) {
+			count++
+		} else if count > 0 {
+			items[i-count] = item
+			// items[i] = nil // 留到最后置空性能会好点
+		}
+	}
+
+	if count > 0 {
+		for i := 1; i <= count; i++ {
+			items[total-i] = nil
+		}
+		r.items = items[:total-count]
+	}
+
+	return count
+}
+
 // serveConn runs in its own goroutine and matches c against routes.
 // It returns whether it matched purely for testing.
-func (p *Proxy) serveConn(c net.Conn, routes []route) bool {
+func (p *Proxy) serveConn(c net.Conn, routes *routes) bool {
 	br := bufio.NewReader(c)
-	for _, route := range routes {
+	for _, route := range routes.routes() {
 		if target, hostName := route.match(br); target != nil {
 			if n := br.Buffered(); n > 0 {
 				peeked, _ := br.Peek(br.Buffered())
@@ -244,6 +540,15 @@ func (p *Proxy) serveConn(c net.Conn, routes []route) bool {
 	log.Printf("tcpproxy: no routes matched conn %v/%v; closing", c.RemoteAddr().String(), c.LocalAddr().String())
 	c.Close()
 	return false
+}
+
+func (p *Proxy) RemoveCredential(c *Credential) (err error) {
+	if err = c.c.RemoveCredential(c); err != nil {
+		log.Printf("c.c.RemoveCredential(%v) met err(%v)", c, err)
+		return
+	}
+
+	return
 }
 
 // Conn is an incoming connection that has had some bytes read from it
@@ -293,6 +598,7 @@ type Target interface {
 	// bytes have been consumed for the purposes of route
 	// matching.
 	HandleConn(net.Conn)
+	Equals(o interface{}) bool
 }
 
 // To is shorthand way of writing &tlsproxy.DialProxy{Addr: addr}.
@@ -336,6 +642,16 @@ type DialProxy struct {
 	// no graceful downgrade.
 	// If zero, no PROXY header is sent. Currently, version 1 is supported.
 	ProxyProtocolVersion int
+}
+
+func (dp *DialProxy) Equals(o interface{}) bool {
+	odp, ok := o.(*DialProxy)
+	if !ok {
+		return false
+	}
+
+	// XXX 以后补齐吧 = =
+	return dp.Addr == odp.Addr
 }
 
 // UnderlyingConn returns c.Conn if c of type *Conn,
