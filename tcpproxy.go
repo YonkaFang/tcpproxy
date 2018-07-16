@@ -63,6 +63,7 @@ import (
 	"time"
 	"sync"
 	"strings"
+	"strconv"
 )
 
 var (
@@ -271,6 +272,13 @@ func (p *Proxy) AddRuntimeRoute(ipPort string, dst Target) (res *Credential, err
 	if index < 0 || index < strings.LastIndex(ipPort, "]") {
 		// no port
 		noPort = true
+	} else {
+		if index, err = strconv.Atoi(ipPort[index+1:]); err != nil {
+			log.Printf("invalid ipPort: (%s)", ipPort)
+			return
+		} else if index == 0 {
+			noPort = true
+		}
 	}
 
 	var config *config
